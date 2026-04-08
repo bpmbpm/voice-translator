@@ -261,6 +261,59 @@ const BergamotTranslator = (() => {
       };
     };
 
+    // Исправление: браузеры блокируют создание Worker из cross-origin URL,
+    // а TranslatorBacking.loadWorker() жёстко прописывает URL воркера через
+    // import.meta.url (CDN-адрес) — браузер отклоняет такой Worker.
+    // Помимо этого, backing.getModels() ждёт загрузки реестра с S3
+    // (bergamot.s3.amazonaws.com/models/index.json), что может зависнуть.
+    //
+    // Исправление 1: getModels() — возвращаем нужную пару языков напрямую,
+    // минуя S3-реестр.
+    backing.getModels = async ({ from, to }) => [{ from, to }];
+
+    // Исправление 2: loadWorker() — создаём Worker через blob URL с
+    // importScripts(), что обходит ограничение cross-origin Workers.
+    const workerUrl = `${BERGAMOT_CDN}/worker/translator-worker.js`;
+    backing.loadWorker = async () => {
+      const blob = new Blob(
+        [`importScripts(${JSON.stringify(workerUrl)});`],
+        { type: "application/javascript" }
+      );
+      const blobUrl = URL.createObjectURL(blob);
+
+      // Повторяем логику из TranslatorBacking.loadWorker() из пакета Bergamot,
+      // используя blob URL вместо cross-origin URL воркера.
+      const worker = new Worker(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      let serial = 0;
+      const pending = new Map();
+
+      const call = (name, ...args) => new Promise((accept, reject) => {
+        const id = ++serial;
+        pending.set(id, { accept, reject, callsite: { message: `${name}(${args.map(String).join(", ")})`, stack: new Error().stack } });
+        worker.postMessage({ id, name, args });
+      });
+
+      worker.addEventListener("message", ({ data: { id, result, error } }) => {
+        if (!pending.has(id)) return;
+        const { accept, reject } = pending.get(id);
+        pending.delete(id);
+        if (error) reject(Object.assign(new Error(), error));
+        else accept(result);
+      });
+
+      worker.addEventListener("error", (e) => {
+        Logger.log(`Ошибка воркера Bergamot: ${e.message}`, "error");
+      });
+
+      const exports = new Proxy({}, {
+        get: (_target, name) => (...args) => call(name, ...args)
+      });
+
+      return { worker, exports };
+    };
+
     translatorInstance = new LatencyOptimisedTranslator({}, backing);
 
     Logger.log("Движок Bergamot готов к работе!", "success");
