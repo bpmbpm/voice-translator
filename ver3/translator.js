@@ -1,5 +1,5 @@
 /**
- * Голосовой переводчик ver3 — основной JS-модуль (ES-модуль)
+ * Голосовой переводчик ver3_6 — основной JS-модуль (ES-модуль)
  *
  * Используемые технологии:
  *  - Распознавание речи: Web Speech API (SpeechRecognition)
@@ -21,7 +21,8 @@ const config = {
   translationDirection: "ru-en",  // "ru-en" или "en-ru"
   voiceGender: "female",           // "female" или "male"
   speechRate: 1.0,
-  pauseDuration: 1500              // мс
+  pauseDuration: 1500,             // мс
+  micGain: 3.0                     // множитель чувствительности микрофона (для теста)
 };
 
 // ============================================================
@@ -35,10 +36,10 @@ const LANG_CODES = {
 };
 
 /**
- * Базовый URL CDN для Bergamot WASM
- * Версия 0.4.9 — последняя стабильная из @browsermt/bergamot-translator
+ * Локальный путь к файлам Bergamot WASM (относительно index.html).
+ * Файлы скопированы из @browsermt/bergamot-translator@0.4.9 в папку bergamot/.
  */
-const BERGAMOT_CDN = "https://cdn.jsdelivr.net/npm/@browsermt/bergamot-translator@0.4.9";
+const BERGAMOT_LOCAL = "./bergamot";
 
 /**
  * Локальные пути к предзагруженным моделям (относительно index.html).
@@ -54,7 +55,6 @@ const REMOTE_MODEL_BASE = "https://bergamot.s3.amazonaws.com/models";
 
 /**
  * Описание файлов модели для каждого направления.
- * Используется при прямой загрузке буферов с прогрессом.
  */
 const MODEL_FILES = {
   "ruen": [
@@ -84,18 +84,15 @@ const Logger = (() => {
     const prefix = { info: "ℹ️", warn: "⚠️", error: "❌", success: "✅" }[level] || "ℹ️";
     const line = `[${timestamp}] ${prefix} ${msg}`;
 
-    // Вывод в консоль для отладки
     if (level === "error") console.error(line);
     else if (level === "warn") console.warn(line);
     else console.log(line);
 
-    // Вывод в UI-панель
     if (logEl) {
       const entry = document.createElement("div");
       entry.className = `log-entry log-entry--${level}`;
       entry.textContent = line;
       logEl.appendChild(entry);
-      // Автопрокрутка вниз
       logEl.scrollTop = logEl.scrollHeight;
     }
   }
@@ -104,15 +101,34 @@ const Logger = (() => {
 })();
 
 // ============================================================
+// Чек-лист инициализации (InitChecklist)
+// ============================================================
+const InitChecklist = (() => {
+  const ICONS = {
+    pending: "○",
+    loading: "⏳",
+    ok:      "✓",
+    warn:    "⚠",
+    error:   "✗"
+  };
+
+  function setItem(id, state, labelOverride) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = `check-item check-item--${state}`;
+    el.querySelector(".check-item__icon").textContent = ICONS[state] || "○";
+    if (labelOverride) {
+      el.querySelector(".check-item__label").textContent = labelOverride;
+    }
+  }
+
+  return { setItem };
+})();
+
+// ============================================================
 // Загрузка файлов с отслеживанием прогресса
 // ============================================================
 
-/**
- * Загружает файл по URL с отслеживанием прогресса.
- * @param {string} url
- * @param {function} onProgress — (loaded, total) => void
- * @returns {Promise<ArrayBuffer>}
- */
 async function fetchWithProgress(url, onProgress) {
   const response = await fetch(url, { credentials: "omit" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -140,20 +156,13 @@ async function fetchWithProgress(url, onProgress) {
   return result.buffer;
 }
 
-/**
- * Загружает файл, пробуя сначала локальный URL, затем удалённый.
- * @param {string} localUrl
- * @param {string} remoteUrl
- * @param {function} onProgress
- * @returns {Promise<ArrayBuffer>}
- */
 async function fetchLocalOrRemote(localUrl, remoteUrl, onProgress) {
   try {
     const buf = await fetchWithProgress(localUrl, onProgress);
     Logger.log(`Загружен локально: ${localUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
     return buf;
   } catch (localErr) {
-    Logger.log(`Локальный файл недоступен: ${localErr.message}. Загрузка с сервера: ${remoteUrl}`, "warn");
+    Logger.log(`Локальный файл недоступен (${localErr.message}). Загружаю с сервера...`, "warn");
     const buf = await fetchWithProgress(remoteUrl, onProgress);
     Logger.log(`Загружен с сервера: ${remoteUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
     return buf;
@@ -164,18 +173,9 @@ async function fetchLocalOrRemote(localUrl, remoteUrl, onProgress) {
 // Модуль перевода Bergamot (BergamotTranslator)
 // ============================================================
 const BergamotTranslator = (() => {
-  // Кэш загруженных буферов моделей: { "ruen": {model, lex, vocab}, ... }
   const bufferCache = {};
-
-  // Экземпляр LatencyOptimisedTranslator (один на весь сеанс)
   let translatorInstance = null;
 
-  /**
-   * Загружает все файлы модели для заданного направления с прогрессом.
-   * @param {string} direction — "ruen" или "enru"
-   * @param {function} onProgress — (percent, label) => void
-   * @returns {Promise<{model:ArrayBuffer, lex:ArrayBuffer, vocab:ArrayBuffer}>}
-   */
   async function preloadBuffers(direction, onProgress) {
     if (bufferCache[direction]) return bufferCache[direction];
 
@@ -189,7 +189,7 @@ const BergamotTranslator = (() => {
       const localUrl  = `${LOCAL_MODEL_BASE}/${direction}/${file.name}`;
       const remoteUrl = `${REMOTE_MODEL_BASE}/${direction}/${file.name}`;
 
-      Logger.log(`Начало загрузки: ${label}`, "info");
+      Logger.log(`Загрузка: ${label}`, "info");
       if (onProgress) onProgress(
         Math.round(((fileIdx - 1) / files.length) * 100),
         label
@@ -209,49 +209,30 @@ const BergamotTranslator = (() => {
     return result;
   }
 
-  /**
-   * Инициализирует экземпляр Bergamot LatencyOptimisedTranslator
-   * с собственным механизмом загрузки модели (без обращения к реестру S3).
-   *
-   * @param {string} direction — "ruen" или "enru"
-   * @param {function} onProgress
-   * @returns {Promise<LatencyOptimisedTranslator>}
-   */
   async function initTranslator(direction, onProgress) {
     if (translatorInstance) return translatorInstance;
 
-    Logger.log("Загрузка WASM-движка Bergamot с CDN...", "info");
+    Logger.log(`Загрузка WASM-модуля Bergamot: ${BERGAMOT_LOCAL}/translator.js`, "info");
     if (onProgress) onProgress(0, "Загрузка WASM-движка...");
 
-    // Импортируем API Bergamot из CDN
-    const { LatencyOptimisedTranslator, TranslatorBacking } = await import(`${BERGAMOT_CDN}/translator.js`);
+    const { LatencyOptimisedTranslator, TranslatorBacking } = await import(`${BERGAMOT_LOCAL}/translator.js`);
 
-    Logger.log("WASM-модуль импортирован, загружаем файлы модели...", "success");
+    Logger.log("WASM-модуль успешно импортирован", "success");
     if (onProgress) onProgress(5, "WASM загружен, загружаем модели...");
 
-    // Предзагружаем буферы модели
     const buffers = await preloadBuffers(direction, (pct, label) => {
       if (onProgress) onProgress(5 + Math.round(pct * 0.90), label);
     });
 
-    Logger.log("Создаём TranslatorBacking с локальными буферами...", "info");
+    Logger.log("Создаём TranslatorBacking с предзагруженными буферами...", "info");
 
-    // Создаём кастомный backing, который переопределяет loadTranslationModel
-    // чтобы использовать уже загруженные буферы вместо загрузки из реестра.
-    const backing = new TranslatorBacking({
-      // Не нужен timeout, т.к. буферы уже загружены
-      downloadTimeout: 0
-    });
+    const backing = new TranslatorBacking({ downloadTimeout: 0 });
 
-    // Переопределяем getTranslationModel для использования наших буферов
     backing.getTranslationModel = async ({ from, to }, _options) => {
       const key = `${from}${to}`;
       const cached = bufferCache[key];
-      if (!cached) {
-        throw new Error(`Буферы модели для ${from}->${to} не загружены`);
-      }
-      Logger.log(`Подача буферов модели ${key} в Bergamot`, "info");
-      // Bergamot ожидает: { model, shortlist, vocabs, qualityModel?, config? }
+      if (!cached) throw new Error(`Буферы модели для ${from}->${to} не загружены`);
+      Logger.log(`Передаём буферы модели ${key} в Bergamot`, "info");
       return {
         model: cached.model,
         shortlist: cached.lex,
@@ -261,28 +242,20 @@ const BergamotTranslator = (() => {
       };
     };
 
-    // Исправление: браузеры блокируют создание Worker из cross-origin URL,
-    // а TranslatorBacking.loadWorker() жёстко прописывает URL воркера через
-    // import.meta.url (CDN-адрес) — браузер отклоняет такой Worker.
-    // Помимо этого, backing.getModels() ждёт загрузки реестра с S3
-    // (bergamot.s3.amazonaws.com/models/index.json), что может зависнуть.
-    //
-    // Исправление 1: getModels() — возвращаем нужную пару языков напрямую,
-    // минуя S3-реестр.
     backing.getModels = async ({ from, to }) => [{ from, to }];
 
-    // Исправление 2: loadWorker() — создаём Worker через blob URL с
-    // importScripts(), что обходит ограничение cross-origin Workers.
-    const workerUrl = `${BERGAMOT_CDN}/worker/translator-worker.js`;
+    // Преобразуем относительный путь в абсолютный URL через document.baseURI.
+    // Это необходимо, потому что importScripts() внутри Blob-воркера разрешает
+    // относительные пути относительно blob:-URL, а не страницы.
+    const workerUrl = new URL(`${BERGAMOT_LOCAL}/worker/translator-worker.js`, document.baseURI).href;
+    Logger.log(`URL воркера Bergamot: ${workerUrl}`, "info");
+
     backing.loadWorker = async () => {
       const blob = new Blob(
         [`importScripts(${JSON.stringify(workerUrl)});`],
         { type: "application/javascript" }
       );
       const blobUrl = URL.createObjectURL(blob);
-
-      // Повторяем логику из TranslatorBacking.loadWorker() из пакета Bergamot,
-      // используя blob URL вместо cross-origin URL воркера.
       const worker = new Worker(blobUrl);
       URL.revokeObjectURL(blobUrl);
 
@@ -311,9 +284,6 @@ const BergamotTranslator = (() => {
         get: (_target, name) => (...args) => call(name, ...args)
       });
 
-      // Инициализируем воркер: создаёт this.models = new Map() и загружает WASM-модуль.
-      // Без этого вызова hasTranslationModel() бросает:
-      // "Cannot read properties of undefined (reading 'has')"
       await call("initialize", backing.options);
 
       return { worker, exports };
@@ -321,18 +291,11 @@ const BergamotTranslator = (() => {
 
     translatorInstance = new LatencyOptimisedTranslator({}, backing);
 
-    Logger.log("Движок Bergamot готов к работе!", "success");
+    Logger.log("Движок Bergamot инициализирован и готов к работе", "success");
     if (onProgress) onProgress(100, "Движок готов!");
     return translatorInstance;
   }
 
-  /**
-   * Переводит текст
-   * @param {string} text — исходный текст
-   * @param {string} direction — "ruen" или "enru"
-   * @param {function} onModelProgress — прогресс загрузки
-   * @returns {Promise<string>} — переведённый текст
-   */
   async function translate(text, direction, onModelProgress) {
     if (!text || !text.trim()) return "";
 
@@ -349,7 +312,6 @@ const BergamotTranslator = (() => {
     return result;
   }
 
-  /** Сбрасывает состояние при смене направления перевода */
   function reset() {
     translatorInstance = null;
     Logger.log("Состояние движка сброшено", "info");
@@ -482,11 +444,82 @@ const SpeechRecognizer = (() => {
 })();
 
 // ============================================================
+// Модуль проверки микрофона (MicTester)
+// ============================================================
+const MicTester = (() => {
+  let audioCtx = null;
+  let analyser = null;
+  let stream = null;
+  let animFrame = null;
+  let gainNode = null;
+
+  async function start(gainValue, onLevel, onStatus) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      onStatus("Микрофон API недоступен (нужен HTTPS)", "err");
+      return;
+    }
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      onStatus("Микрофон подключён: " + (stream.getAudioTracks()[0]?.label || "устройство"), "ok");
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(stream);
+
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = gainValue;
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+
+      source.connect(gainNode);
+      gainNode.connect(analyser);
+
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+
+      function tick() {
+        analyser.getByteFrequencyData(buf);
+        const rms = Math.sqrt(buf.reduce((s, v) => s + v * v, 0) / buf.length);
+        const pct = Math.min(100, Math.round(rms * 100 / 128));
+        onLevel(pct);
+        animFrame = requestAnimationFrame(tick);
+      }
+      tick();
+
+    } catch (err) {
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        onStatus("Доступ запрещён — разрешите в браузере", "err");
+      } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        onStatus("Микрофон не найден", "err");
+      } else {
+        onStatus(`Ошибка: ${err.name}`, "warn");
+      }
+      Logger.log(`Тест микрофона — ошибка (${err.name}): ${err.message}`, "warn");
+    }
+  }
+
+  function setGain(value) {
+    if (gainNode) gainNode.gain.value = value;
+  }
+
+  function stop() {
+    if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+    if (audioCtx)  { audioCtx.close(); audioCtx = null; }
+    if (stream)    { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    analyser = null;
+    gainNode = null;
+  }
+
+  return { start, stop, setGain };
+})();
+
+// ============================================================
 // Основной контроллер приложения
 // ============================================================
 const App = (() => {
   let isActive = false;
   let bergamotReady = false;
+  let microphoneReady = false;
   const el = {};
 
   function getModelDirection() {
@@ -512,10 +545,8 @@ const App = (() => {
     el.modelProgressLabel = document.getElementById("modelProgressLabel");
     el.logPanel           = document.getElementById("logPanel");
 
-    // Инициализируем журнал
     Logger.init(el.logPanel);
-    Logger.log("Приложение запущено", "info");
-    Logger.log(`SharedArrayBuffer: ${typeof SharedArrayBuffer !== "undefined" ? "доступен" : "недоступен (COOP/COEP не установлены)"}`, "info");
+    Logger.log("=== Голосовой переводчик ver3_6 запускается ===", "info");
 
     loadConfigToUI();
 
@@ -530,38 +561,173 @@ const App = (() => {
     });
 
     document.getElementById("applyConfig").addEventListener("click", applyConfig);
-
     document.getElementById("clearLogBtn").addEventListener("click", () => {
       el.logPanel.innerHTML = "";
       Logger.log("Журнал очищен", "info");
     });
 
+    // Кнопка открытия модального окна теста микрофона
+    document.getElementById("micTestBtn").addEventListener("click", openMicModal);
+
+    initMicModal();
+
+    await runInitChecks();
+  }
+
+  // ----------------------------------------------------------
+  // Пошаговая инициализация с чек-листом
+  // ----------------------------------------------------------
+  async function runInitChecks() {
+    // Шаг 1: Совместимость браузера
+    setStatus("Проверка браузера...", "loading");
+    InitChecklist.setItem("chk-browser", "loading", "Проверка браузера...");
+    Logger.log("Шаг 1/5: Проверка совместимости браузера", "info");
+
+    const hasSpeechRecognition = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+    const hasSpeechSynthesis   = !!window.speechSynthesis;
+    const hasWorker            = !!window.Worker;
+
+    if (!hasSpeechRecognition) {
+      Logger.log("SpeechRecognition не поддерживается! Требуется Chrome или Edge.", "error");
+      InitChecklist.setItem("chk-browser", "error", "SpeechRecognition не поддерживается (нужен Chrome/Edge)");
+      setStatus("Браузер не поддерживается. Используйте Chrome или Edge.", "error");
+      return;
+    }
+
+    Logger.log(`SpeechRecognition: ✓ (${window.SpeechRecognition ? "стандарт" : "webkit-префикс"})`, "success");
+    Logger.log(`SpeechSynthesis: ${hasSpeechSynthesis ? "✓" : "✗ (озвучка недоступна)"}`, hasSpeechSynthesis ? "success" : "warn");
+    Logger.log(`Web Worker: ${hasWorker ? "✓" : "✗ (WASM-движок недоступен)"}`, hasWorker ? "success" : "warn");
+    InitChecklist.setItem("chk-browser", "ok", `Браузер совместим (${navigator.userAgent.split(" ").pop()})`);
+
+    // Шаг 2: SharedArrayBuffer / COOP+COEP
+    setStatus("Проверка SharedArrayBuffer...", "loading");
+    InitChecklist.setItem("chk-sab", "loading", "Проверка SharedArrayBuffer (COOP/COEP)...");
+    Logger.log("Шаг 2/5: Проверка SharedArrayBuffer", "info");
+
+    const hasSAB = typeof SharedArrayBuffer !== "undefined";
+    if (hasSAB) {
+      Logger.log("SharedArrayBuffer: ✓ (COOP/COEP заголовки установлены)", "success");
+      InitChecklist.setItem("chk-sab", "ok", "SharedArrayBuffer доступен (COOP/COEP ✓)");
+    } else {
+      Logger.log("SharedArrayBuffer недоступен — WASM-движок может не работать.", "warn");
+      InitChecklist.setItem("chk-sab", "warn", "SharedArrayBuffer недоступен (COOP/COEP не установлены)");
+    }
+
+    // Шаг 3: Доступ к микрофону
+    setStatus("Запрос доступа к микрофону...", "loading");
+    InitChecklist.setItem("chk-mic", "loading", "Запрашиваем доступ к микрофону...");
+    Logger.log("Шаг 3/5: Проверка доступа к микрофону", "info");
+
+    microphoneReady = await checkMicrophone();
+
+    // Шаг 4: Загрузка WASM-движка Bergamot
+    setStatus("Загрузка WASM-движка...", "loading");
+    InitChecklist.setItem("chk-wasm", "loading", "Загрузка WASM-движка Bergamot...");
+    Logger.log("Шаг 4/5: Загрузка WASM-движка Bergamot", "info");
+
+    // Шаг 5: Загрузка модели перевода
     await preloadModel();
+  }
+
+  /**
+   * Проверяет доступ к микрофону через getUserMedia.
+   * При ошибке выводит краткое сообщение в статус и детали — в журнал.
+   * @returns {Promise<boolean>}
+   */
+  async function checkMicrophone() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      Logger.log("navigator.mediaDevices.getUserMedia недоступен (нужен HTTPS)", "warn");
+      InitChecklist.setItem("chk-mic", "warn", "Микрофон: API недоступен (нужен HTTPS)");
+      return false;
+    }
+
+    try {
+      Logger.log("Запрашиваем доступ к микрофону...", "info");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+      const tracks = stream.getAudioTracks();
+      if (tracks.length === 0) {
+        Logger.log("Разрешение получено, но аудио-трек не найден", "warn");
+        InitChecklist.setItem("chk-mic", "warn", "Микрофон: трек не найден");
+        stream.getTracks().forEach(t => t.stop());
+        return false;
+      }
+
+      const trackLabel = tracks[0].label || "неизвестное устройство";
+      Logger.log(`Микрофон доступен: "${trackLabel}"`, "success");
+      InitChecklist.setItem("chk-mic", "ok", `Микрофон: ${trackLabel}`);
+
+      stream.getTracks().forEach(t => t.stop());
+      return true;
+
+    } catch (err) {
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        Logger.log(`Доступ к микрофону запрещён: ${err.message}`, "error");
+        InitChecklist.setItem("chk-mic", "error", "Микрофон: запрещён (разрешите в браузере)");
+      } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        Logger.log(`Микрофон не найден: ${err.message}`, "error");
+        InitChecklist.setItem("chk-mic", "error", "Микрофон не найден");
+      } else if (err.name === "NotReadableError" || err.name === "TrackStartError") {
+        // Эта ошибка не всегда означает, что микрофон занят — может быть аппаратный сбой
+        // или проблема с драйвером. Подробности — в журнале, статус — краткий.
+        Logger.log(
+          `Ошибка доступа к микрофону (${err.name}): ${err.message}. ` +
+          `Возможные причины: занят другим приложением (Zoom, Teams, Discord, OBS), ` +
+          `проблема с драйвером или аппаратная ошибка. ` +
+          `Попробуйте: закрыть другие приложения, отключить/подключить микрофон, перезапустить браузер.`,
+          "warn"
+        );
+        InitChecklist.setItem("chk-mic", "warn", "Микрофон недоступен — подробности в журнале");
+      } else {
+        Logger.log(`Ошибка микрофона (${err.name}): ${err.message}`, "warn");
+        InitChecklist.setItem("chk-mic", "warn", `Микрофон: ${err.name}`);
+      }
+      return false;
+    }
   }
 
   async function preloadModel() {
     const direction = getModelDirection();
-    setStatus("Загрузка WASM-движка и модели перевода...", "loading");
+    InitChecklist.setItem("chk-model", "loading", "Загрузка модели перевода...");
     showProgress(true);
-
-    Logger.log(`Предзагрузка модели для направления: ${direction}`, "info");
+    Logger.log(`Шаг 5/5: Загрузка модели для направления: ${direction}`, "info");
 
     try {
-      // Тестовый перевод инициализирует всё: движок + модель
       await BergamotTranslator.translate("тест", direction, (pct, label) => {
         updateProgress(pct, label);
+        if (pct < 10) {
+          InitChecklist.setItem("chk-wasm", "loading", `WASM: ${label}`);
+        } else {
+          InitChecklist.setItem("chk-wasm", "ok", "WASM-движок Bergamot загружен ✓");
+          InitChecklist.setItem("chk-model", "loading", label);
+        }
       });
+
       bergamotReady = true;
-      setStatus("Движок готов. Нажмите «Старт»", "ready");
+      InitChecklist.setItem("chk-wasm", "ok", "WASM-движок Bergamot загружен ✓");
+      InitChecklist.setItem("chk-model", "ok", `Модель ${direction} загружена ✓`);
       showProgress(false);
+
+      Logger.log("=== Инициализация завершена успешно ===", "success");
+
+      if (microphoneReady) {
+        setStatus("Готов. Нажмите «Старт» для начала перевода.", "ready");
+      } else {
+        setStatus("Движок готов. Микрофон недоступен — нажмите «Тест микрофона».", "warn");
+      }
       el.startBtn.disabled = false;
-      Logger.log("Движок Bergamot успешно готов к работе!", "success");
+
     } catch (err) {
       Logger.log(`Bergamot недоступен: ${err.message}`, "error");
-      Logger.log("Используется резервный переводчик MyMemory API", "warn");
+      Logger.log("Переключаемся на резервный переводчик MyMemory API", "warn");
+
+      InitChecklist.setItem("chk-wasm", "warn", "WASM недоступен → резервный MyMemory API");
+      InitChecklist.setItem("chk-model", "warn", "Локальная модель не загружена → MyMemory API");
+
       bergamotReady = false;
-      setStatus("Локальный движок недоступен → используется MyMemory API. Нажмите «Старт»", "ready");
       showProgress(false);
+
+      setStatus("Локальный движок недоступен → MyMemory API. Нажмите «Старт».", "warn");
       el.startBtn.disabled = false;
     }
   }
@@ -618,7 +784,7 @@ const App = (() => {
     el.startBtn.disabled = true;
     el.stopBtn.disabled  = false;
     setStatus("Слушаю...");
-    Logger.log("Сеанс перевода начат", "success");
+    Logger.log("=== Сеанс перевода начат ===", "success");
 
     const langs = LANG_CODES[config.translationDirection];
 
@@ -646,10 +812,9 @@ const App = (() => {
 
           el.targetText.textContent = translatedText;
           setStatus("Озвучиваю...");
-
           SpeechSynthesizer.speak(translatedText, langs.target, config.voiceGender, config.speechRate);
-
           setStatus("Слушаю...");
+
         } catch (err) {
           Logger.log(`Ошибка перевода: ${err.message}`, "error");
           setStatus(`Ошибка перевода: ${err.message}`, "error");
@@ -674,7 +839,7 @@ const App = (() => {
     el.startBtn.disabled = false;
     el.stopBtn.disabled  = true;
     setStatus("Остановлено");
-    Logger.log("Сеанс перевода завершён", "info");
+    Logger.log("=== Сеанс перевода завершён ===", "info");
   }
 
   function setStatus(msg, type = "") {
@@ -689,6 +854,77 @@ const App = (() => {
   function updateProgress(pct, label) {
     el.modelProgressBar.style.width   = pct + "%";
     el.modelProgressLabel.textContent = label;
+  }
+
+  // ----------------------------------------------------------
+  // Модальное окно проверки микрофона
+  // ----------------------------------------------------------
+  function initMicModal() {
+    const overlay      = document.getElementById("micModal");
+    const btnStart     = document.getElementById("micTestStart");
+    const btnStop      = document.getElementById("micTestStop");
+    const btnClose     = document.getElementById("micTestClose");
+    const btnModalX    = document.getElementById("micModalClose");
+    const levelBar     = document.getElementById("micLevelBar");
+    const levelLabel   = document.getElementById("micLevelLabel");
+    const statusEl     = document.getElementById("micModalStatus");
+    const gainInput    = document.getElementById("micGainInput");
+    const gainValue    = document.getElementById("micGainValue");
+
+    gainInput.addEventListener("input", () => {
+      const v = parseFloat(gainInput.value);
+      gainValue.textContent = v.toFixed(1) + "×";
+      config.micGain = v;
+      MicTester.setGain(v);
+    });
+
+    btnStart.addEventListener("click", async () => {
+      btnStart.disabled = true;
+      btnStop.disabled  = false;
+      setModalStatus("Запрашиваем доступ к микрофону...", "");
+
+      await MicTester.start(
+        config.micGain,
+        (pct) => {
+          levelBar.style.width = pct + "%";
+          levelLabel.textContent = `Уровень сигнала: ${pct}%`;
+        },
+        (msg, cls) => setModalStatus(msg, cls)
+      );
+    });
+
+    btnStop.addEventListener("click", () => {
+      MicTester.stop();
+      btnStart.disabled = false;
+      btnStop.disabled  = true;
+      levelBar.style.width = "0%";
+      levelLabel.textContent = "Уровень сигнала: —";
+      setModalStatus("Тест остановлен", "");
+    });
+
+    function close() {
+      MicTester.stop();
+      btnStart.disabled = false;
+      btnStop.disabled  = true;
+      levelBar.style.width = "0%";
+      levelLabel.textContent = "Уровень сигнала: —";
+      overlay.classList.remove("visible");
+    }
+
+    btnClose.addEventListener("click", close);
+    btnModalX.addEventListener("click", close);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    function setModalStatus(msg, cls) {
+      statusEl.textContent = msg;
+      statusEl.className   = "mic-status" + (cls ? ` mic-status--${cls}` : "");
+    }
+  }
+
+  function openMicModal() {
+    document.getElementById("micModal").classList.add("visible");
   }
 
   return { init };
